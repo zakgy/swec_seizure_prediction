@@ -5,15 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset
-import time
-import shutil
 import os
-import pickle
 import matplotlib.pyplot as plt
 from scipy.io import loadmat
-from scipy.signal import stft, decimate
-from sklearn.metrics import roc_auc_score, confusion_matrix, f1_score, roc_curve, precision_recall_curve, auc
-from sklearn.utils.class_weight import compute_class_weight
+from scipy.signal import decimate
+from sklearn.metrics import confusion_matrix, f1_score, roc_curve, precision_recall_curve, auc
 
 FILE_DURATION = 3600
 
@@ -115,6 +111,8 @@ def get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, distan
     file_index_list = []
     while(True):
         if (not os.path.exists(subject_path + '_' + str(file_index) + 'h.mat')):
+            if (len(file_index_list) == 0):
+                print("ERROR: no interictal segments selected.")
             if (file_index_list[-1] == file_index-1):
                 file_index_list.pop()
             break
@@ -163,6 +161,53 @@ def load_data(subject_path, seq_duration, sph, pil, distance, channels=[0], dtyp
     segments = np.concatenate((interictal, preictal), axis=0)
 
     return segments, labels, fs
+
+# load swec data, where test data has a different seizure than train data
+def load_data_partitioned(subject_path, seq_duration, sph, pil, distance, channels=[0], dtype=np.float64, num_test_sz=1):
+    # load info file
+    data_info = loadmat(subject_path + '_info.mat')
+    seizure_begin = data_info['seizure_begin']
+    seizure_end = data_info['seizure_end']
+    fs = data_info['fs'][0][0]
+
+    print(seizure_begin)
+    print(seizure_end)
+
+    n_channels = loadmat(subject_path + '_' + str(1) + 'h.mat')['EEG'].shape[0]
+    if (len(channels) == 0):
+        channels = np.arange(n_channels)
+
+    seq_len = seq_duration * fs
+
+    preictal_train = np.zeros(((len(seizure_begin) - num_test_sz) * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
+    preictal_test = np.zeros((num_test_sz * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
+
+    i = 0
+    for s in range(len(seizure_begin) - num_test_sz):
+        preictal_train[i:i + (pil // seq_duration)] = get_preictal(subject_path, seizure_begin[s], seq_len, fs, sph, pil, channels, dtype=dtype)
+        i += (pil // seq_duration)
+    print(preictal_train.shape)
+
+    i = 0
+    for s in range(len(seizure_begin) - num_test_sz, len(seizure_begin)):
+        preictal_test[i:i + (pil // seq_duration)] = get_preictal(subject_path, seizure_begin[s], seq_len, fs, sph, pil, channels, dtype=dtype)
+        i += (pil // seq_duration)
+    
+    interictal = get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, distance, channels, dtype=dtype)
+    print(interictal.shape)
+
+    split_idx = int(len(interictal) * (1 - (num_test_sz / len(seizure_begin))))
+    
+    interictal_train = interictal[:split_idx]
+    interictal_test = interictal[split_idx:]
+
+    tr_labels = np.concatenate((np.zeros(len(interictal_train)), np.ones(preictal_train)))
+    tr_segments = np.concatenate((interictal_train, preictal_train), axis=0)
+
+    ts_labels = np.concatenate((np.zeros(len(interictal_test)), np.ones(preictal_test)))
+    ts_segments = np.concatenate((interictal_test, preictal_test), axis=0)
+
+    return tr_segments, tr_labels, ts_segments, ts_labels, fs
 
 # Dataset class
 class STFTDataset(Dataset):
