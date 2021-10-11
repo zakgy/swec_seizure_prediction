@@ -11,8 +11,11 @@ from scipy.io import loadmat
 from scipy.signal import decimate
 from sklearn.metrics import confusion_matrix, f1_score, roc_curve, precision_recall_curve, auc
 
+SEED = 0
 FILE_DURATION = 3600
 POSTICTAL_LENGTH = 1800
+LEAD_SEIZURE_DISTANCE = 3600 * 4 # 4 hours from the last seziure for lead seizure, taken from Shiao et al.
+SPH = 0
 
 # dict to convert numpy dtypes to torch dtypes
 numpy_to_torch_dtype_dict = {
@@ -76,6 +79,7 @@ def find_file_index(t, fs):
 def get_preictal(subject_path, seizure_begin, seq_len, fs, sph, pil, channels=[0], overlap=0, dtype=np.float64):
     preictal_begin = seizure_begin - (sph + pil)
     file_index, offset = find_file_index(preictal_begin, fs)
+    print(file_index)
 
     preictal_eeg = loadmat(subject_path + '_' + str(file_index) + 'h.mat')['EEG']
     n_files = math.ceil(pil/FILE_DURATION)
@@ -117,13 +121,13 @@ def get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, sph, p
             break
         if (not in_seizure_bounds(file_index, seizure_begin, seizure_end, sph, pil, distance)):
             file_index_list.append(file_index)
+            print(file_index)
         file_index += 1
 
     segs_per_file = (FILE_DURATION * fs // seq_len) // ds
     interictal_segments = np.zeros(((len(file_index_list) * segs_per_file), seq_len, len(channels)), dtype=dtype)
     
-    seed = 0
-    np.random.seed(seed)
+    np.random.seed(SEED)
     for i, idx in enumerate(file_index_list):
         eeg = loadmat(subject_path + '_' + str(idx) + 'h.mat')['EEG']
         segments = sliding_window(eeg[channels,:], seq_len, dtype=dtype)
@@ -151,7 +155,7 @@ def load_data(subject_path, seq_duration, sph, pil, distance, channels=[], ds=1,
 
     to_remove = []
     for i in range(1, len(seizure_begin)):
-        if (seizure_begin[i] - seizure_end[i-1] < pil + sph):
+        if (seizure_begin[i] < seizure_end[i-1] + LEAD_SEIZURE_DISTANCE):
             to_remove.append(i)
     for i in range(len(seizure_begin)):
         if (seizure_begin[i] - sph - pil < 0 and not i in to_remove):
@@ -192,7 +196,7 @@ def load_data_partitioned(subject_path, seq_duration, sph, pil, distance, channe
         print(seizure_begin)
         print(seizure_end)
 
-    if (num_test_sz >= len(seizure_begin)):
+    if (num_test_sz + 1 >= len(seizure_begin)):
         print("ERROR: num_test_sz must be less than the total number of seizures")
 
     n_channels = loadmat(subject_path + '_' + str(1) + 'h.mat')['EEG'].shape[0]
@@ -204,7 +208,7 @@ def load_data_partitioned(subject_path, seq_duration, sph, pil, distance, channe
     # remove seizures that are too close to the previous one
     to_remove = []
     for i in range(1, len(seizure_begin)):
-        if (seizure_begin[i] - (seizure_end[i-1] + POSTICTAL_LENGTH) < pil + sph):
+        if (seizure_begin[i] < seizure_end[i-1] + LEAD_SEIZURE_DISTANCE):
             to_remove.append(i)
     if (verbose):
         print(to_remove)
@@ -212,15 +216,24 @@ def load_data_partitioned(subject_path, seq_duration, sph, pil, distance, channe
         seizure_begin = np.delete(seizure_begin, to_remove, axis=0)
         seizure_end = np.delete(seizure_end, to_remove, axis=0)
 
-    preictal_train = np.zeros(((len(seizure_begin) - num_test_sz) * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
+    num_val_sz = 1
+    preictal_train = np.zeros(((len(seizure_begin) - num_test_sz - 1) * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
+    preictal_val = np.zeros((num_val_sz * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
     preictal_test = np.zeros((num_test_sz * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
 
     i = 0
-    for s in range(len(seizure_begin) - num_test_sz):
+    for s in range(len(seizure_begin) - num_test_sz - num_val_sz):
         preictal_train[i:i + (pil // seq_duration)] = get_preictal(subject_path, seizure_begin[s], seq_len, fs, sph, pil, channels, dtype=dtype)
         i += (pil // seq_duration)
     if (verbose):
         print(preictal_train.shape)
+
+    i = 0
+    for s in range(len(seizure_begin) - num_test_sz - num_val_sz, len(seizure_begin) - num_test_sz):
+        preictal_val[i:i + (pil // seq_duration)] = get_preictal(subject_path, seizure_begin[s], seq_len, fs, sph, pil, channels, dtype=dtype)
+        i += (pil // seq_duration)
+    if (verbose):
+        print(preictal_val.shape)
 
     i = 0
     for s in range(len(seizure_begin) - num_test_sz, len(seizure_begin)):
@@ -233,18 +246,80 @@ def load_data_partitioned(subject_path, seq_duration, sph, pil, distance, channe
     if (verbose):
         print(interictal.shape)
 
-    split_idx = int(len(interictal) * (1 - (num_test_sz / len(seizure_begin))))
+    split_idx_1 = int(len(interictal) * (1 - ((num_val_sz + num_test_sz) / len(seizure_begin))))
+    split_idx_2 = int(len(interictal) * (1 - ((num_test_sz) / len(seizure_begin))))
     
-    interictal_train = interictal[:split_idx]
-    interictal_test = interictal[split_idx:]
+    interictal_train = interictal[:split_idx_1]
+    interictal_val = interictal[split_idx_1:split_idx_2]
+    interictal_test = interictal[split_idx_2:]
 
     tr_labels = np.concatenate((np.zeros(len(interictal_train)), np.ones(len(preictal_train))))
     tr_segments = np.concatenate((interictal_train, preictal_train), axis=0)
+    
+    vl_labels = np.concatenate((np.zeros(len(interictal_val)), np.ones(len(preictal_val))))
+    vl_segments = np.concatenate((interictal_val, preictal_val), axis=0)
 
     ts_labels = np.concatenate((np.zeros(len(interictal_test)), np.ones(len(preictal_test))))
     ts_segments = np.concatenate((interictal_test, preictal_test), axis=0)
 
-    return tr_segments, tr_labels, ts_segments, ts_labels, fs
+    return tr_segments, vl_segments, ts_segments, tr_labels, vl_labels, ts_labels, fs
+
+def load_data_partitions(subject_path, seq_duration, pil, distance, channels=[], ds=1, dtype=np.float64, shuffle=False, verbose=False):
+    np.random.seed(SEED)
+    # load info file
+    data_info = loadmat(subject_path + '_info.mat')
+    seizure_begin = data_info['seizure_begin']
+    seizure_end = data_info['seizure_end']
+    fs = data_info['fs'][0][0]
+
+    if (verbose):
+        print(seizure_begin)
+        print(seizure_end)
+
+    n_channels = loadmat(subject_path + '_' + str(1) + 'h.mat')['EEG'].shape[0]
+    if (len(channels) == 0):
+        channels = np.arange(n_channels)
+
+    to_remove = []
+    for i in range(1, len(seizure_begin)):
+        if (seizure_begin[i] < seizure_end[i-1] + LEAD_SEIZURE_DISTANCE):
+            to_remove.append(i)
+    for i in range(len(seizure_begin)):
+        if (seizure_begin[i] - SPH - pil < 0 and not i in to_remove):
+            to_remove.append(i)
+
+    if (verbose):
+        print(to_remove)
+    if (len(to_remove) > 0):
+        seizure_begin = np.delete(seizure_begin, to_remove, axis=0)
+        seizure_end = np.delete(seizure_end, to_remove, axis=0)
+
+    seq_len = seq_duration * fs
+
+    preictal = np.zeros((len(seizure_begin), pil // seq_duration, seq_len, len(channels)), dtype=dtype)
+    i = 0
+    for s in seizure_begin:
+        preictal[i] = get_preictal(subject_path, s, seq_len, fs, SPH, pil, channels, dtype=dtype)
+        i += 1
+    if(shuffle):
+        preictal = np.array_split(np.random.shuffle(np.concatenate(preictal[:])))
+    if (verbose):
+        print(preictal.shape)
+
+    interictal = get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, SPH, pil, distance, channels, ds=ds, dtype=dtype)
+    if(shuffle):
+        interictal = np.random.shuffle(interictal)
+    if (verbose):
+        print(interictal.shape)
+    interictal = np.array_split(interictal, len(seizure_begin), axis=0)
+    
+
+    data = []
+    for n in range(len(seizure_begin)):
+        labels = np.concatenate((np.zeros(len(interictal[n])), np.ones(len(preictal[n]))))
+        segments = np.concatenate((interictal[n], preictal[n]), axis=0)
+        data.append([segments, labels])
+    return data, fs
 
 # Dataset class
 class STFTDataset(Dataset):
@@ -260,13 +335,29 @@ class STFTDataset(Dataset):
 
 # Results class
 class Results:
-    def __init__(self, loss, sen, spe, auc, f1, pr_auc):
+    def __init__(self, loss=0, sen=0, spe=0, auc=0, f1=0, pr_auc=0):
         self.loss = loss
         self.sen = sen
         self.spe = spe
         self.auc = auc
         self.f1 = f1
         self.pr_auc = pr_auc
+    
+    def add(self, other):
+        self.loss += other.loss[-1]
+        self.sen += other.sen[-1]
+        self.spe += other.spe[-1]
+        self.auc += other.auc[-1]
+        self.f1 += other.f1[-1]
+        self.pr_auc += other.pr_auc[-1]
+    
+    def divide(self, scalar):
+        self.loss /= scalar
+        self.sen /= scalar
+        self.spe /= scalar
+        self.auc /= scalar
+        self.f1 /= scalar
+        self.pr_auc /= scalar    
 
 def evaluate_performance(y_pred, y_true):
     y_pred = y_pred.astype(np.float64)
@@ -363,10 +454,14 @@ def plot_training(t_res, v_res):
     ax[3].set_title('AUC')
     plt.show()
 
+def print_results(res, partition):
+    print(partition + ":")
+    print(f"\tLoss: {res.loss}\n\tSensitivity: {res.sen}\n\tSpecificity: {res.spe}\n\tAUC: {res.auc}\n\tF1 Score: {res.f1}\n\tPR AUC: {res.pr_auc}")
+
 # full training of model
-def training_model(model, epochs, device, weights, train_loader, val_loader, dtype, plot_results=False, verbose=True):
+def training_model(model, epochs, device, weights, train_loader, val_loader, dtype, lr=0.0005, plot_results=False, verbose=True):
     criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = optim.Adam(model.parameters(), lr=0.0005, eps=1e-04)
+    optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-04)
 
     train_loss = []
     train_sen = []
@@ -402,8 +497,9 @@ def training_model(model, epochs, device, weights, train_loader, val_loader, dty
         val_f1.append(f1_vl)
         val_pr.append(pr_vl)
 
-    print(f"Training:\n\tLoss: {train_loss[-1]}\n\tSensitivity: {train_sen[-1]}\n\tSpecificity: {train_spe[-1]}\n\tAUC: {train_auc[-1]}\n\tF1 Score: {train_f1[-1]}\n\tPR AUC: {train_pr[-1]}")
-    print(f"Validation:\n\tLoss: {val_loss[-1]}\n\tSensitivity: {val_sen[-1]}\n\tSpecificity: {val_spe[-1]}\n\tAUC: {val_auc[-1]}\n\tF1 Score: {val_f1[-1]}\n\tPR AUC: {val_pr[-1]}")
+    if (verbose):
+        print(f"Training:\n\tLoss: {train_loss[-1]}\n\tSensitivity: {train_sen[-1]}\n\tSpecificity: {train_spe[-1]}\n\tAUC: {train_auc[-1]}\n\tF1 Score: {train_f1[-1]}\n\tPR AUC: {train_pr[-1]}")
+        print(f"Validation:\n\tLoss: {val_loss[-1]}\n\tSensitivity: {val_sen[-1]}\n\tSpecificity: {val_spe[-1]}\n\tAUC: {val_auc[-1]}\n\tF1 Score: {val_f1[-1]}\n\tPR AUC: {val_pr[-1]}")
 
     train_results = Results(train_loss, train_sen, train_spe, train_auc, train_f1, train_pr)
     val_results = Results(val_loss, val_sen, val_spe, val_auc, val_f1, val_pr)
