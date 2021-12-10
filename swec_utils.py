@@ -15,7 +15,6 @@ SEED = 0
 FILE_DURATION = 3600
 POSTICTAL_LENGTH = 1800
 LEAD_SEIZURE_DISTANCE = 3600 * 4 # 4 hours from the last seziure for lead seizure, taken from Shiao et al.
-SPH = 0
 
 # dict to convert numpy dtypes to torch dtypes
 numpy_to_torch_dtype_dict = {
@@ -79,7 +78,6 @@ def find_file_index(t, fs):
 def get_preictal(subject_path, seizure_begin, seq_len, fs, sph, pil, channels=[0], overlap=0, dtype=np.float64):
     preictal_begin = seizure_begin - (sph + pil)
     file_index, offset = find_file_index(preictal_begin, fs)
-    print(file_index)
 
     preictal_eeg = loadmat(subject_path + '_' + str(file_index) + 'h.mat')['EEG']
     n_files = math.ceil(pil/FILE_DURATION)
@@ -121,7 +119,6 @@ def get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, sph, p
             break
         if (not in_seizure_bounds(file_index, seizure_begin, seizure_end, sph, pil, distance)):
             file_index_list.append(file_index)
-            print(file_index)
         file_index += 1
 
     segs_per_file = (FILE_DURATION * fs // seq_len) // ds
@@ -135,136 +132,22 @@ def get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, sph, p
         interictal_segments[i*segs_per_file:i*segs_per_file+segs_per_file] = segments[sampled_idxs]
     return interictal_segments
 
-# load swec data
-def load_data(subject_path, seq_duration, sph, pil, distance, channels=[], ds=1, dtype=np.float64, verbose=False):
-    # load info file
-    data_info = loadmat(subject_path + '_info.mat')
-    seizure_begin = data_info['seizure_begin']
-    seizure_end = data_info['seizure_end']
-    fs = data_info['fs'][0][0]
+def get_interictal_new(subject_path, seizure_begin, seq_len, fs, sph, pil, distance, channels=[0], ds=1, dtype=np.float64):
+    interictal_end = seizure_begin - (sph + pil + distance)
+    interictal_start = interictal_end - LEAD_SEIZURE_DISTANCE
 
-    if (verbose):
-        print(seizure_begin)
-        print(seizure_end)
+    start_index, start_offset = find_file_index(interictal_start, fs)
+    end_index, end_offset = find_file_index(interictal_end, fs)
+    file_indices = np.arange(start_index, end_index+1, dtype=int)
+    interictal = np.zeros((len(channels), (end_index - start_index + 1)*FILE_DURATION*fs), dtype=dtype)
+    for i, idx in enumerate(file_indices):
+        eeg = loadmat(subject_path + '_' + str(idx) + 'h.mat')['EEG']
+        interictal[:, i*FILE_DURATION*fs:(i+1)*FILE_DURATION*fs] = eeg[channels, :]
+    interictal = interictal[:, start_offset:(end_index - start_index)*FILE_DURATION*fs + end_offset]
+    interictal_segments = sliding_window(interictal, seq_len, dtype=dtype)
+    return interictal_segments
 
-    n_channels = loadmat(subject_path + '_' + str(1) + 'h.mat')['EEG'].shape[0]
-    if (len(channels) == 0):
-        channels = np.arange(n_channels)
-
-    seq_len = seq_duration * fs
-
-    to_remove = []
-    for i in range(1, len(seizure_begin)):
-        if (seizure_begin[i] < seizure_end[i-1] + LEAD_SEIZURE_DISTANCE):
-            to_remove.append(i)
-    for i in range(len(seizure_begin)):
-        if (seizure_begin[i] - sph - pil < 0 and not i in to_remove):
-            to_remove.append(i)
-
-    if (verbose):
-        print(to_remove)
-    if (len(to_remove) > 0):
-        seizure_begin = np.delete(seizure_begin, to_remove, axis=0)
-        seizure_end = np.delete(seizure_end, to_remove, axis=0)
-
-    preictal = np.zeros((len(seizure_begin) * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
-    i = 0
-    for s in seizure_begin:
-        preictal[i:i + (pil // seq_duration)] = get_preictal(subject_path, s, seq_len, fs, sph, pil, channels, dtype=dtype)
-        i += (pil // seq_duration)
-    if (verbose):
-        print(preictal.shape)
-
-    interictal = get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, sph, pil, distance, channels, ds=ds, dtype=dtype)
-    if (verbose):
-        print(interictal.shape)
-
-    labels = np.concatenate((np.zeros(len(interictal)), np.ones(len(preictal))))
-    segments = np.concatenate((interictal, preictal), axis=0)
-
-    return segments, labels, fs
-
-# load swec data, where test data has a different seizure than train data
-def load_data_partitioned(subject_path, seq_duration, sph, pil, distance, channels=[], ds=1, dtype=np.float64, num_test_sz=1, verbose=False):
-    # load info file
-    data_info = loadmat(subject_path + '_info.mat')
-    seizure_begin = data_info['seizure_begin']
-    seizure_end = data_info['seizure_end']
-    fs = data_info['fs'][0][0]
-
-    if (verbose):
-        print(seizure_begin)
-        print(seizure_end)
-
-    if (num_test_sz + 1 >= len(seizure_begin)):
-        print("ERROR: num_test_sz must be less than the total number of seizures")
-
-    n_channels = loadmat(subject_path + '_' + str(1) + 'h.mat')['EEG'].shape[0]
-    if (len(channels) == 0):
-        channels = np.arange(n_channels)
-
-    seq_len = seq_duration * fs
-    
-    # remove seizures that are too close to the previous one
-    to_remove = []
-    for i in range(1, len(seizure_begin)):
-        if (seizure_begin[i] < seizure_end[i-1] + LEAD_SEIZURE_DISTANCE):
-            to_remove.append(i)
-    if (verbose):
-        print(to_remove)
-    if (len(to_remove) > 0):
-        seizure_begin = np.delete(seizure_begin, to_remove, axis=0)
-        seizure_end = np.delete(seizure_end, to_remove, axis=0)
-
-    num_val_sz = 1
-    preictal_train = np.zeros(((len(seizure_begin) - num_test_sz - 1) * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
-    preictal_val = np.zeros((num_val_sz * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
-    preictal_test = np.zeros((num_test_sz * pil // seq_duration, seq_len, len(channels)), dtype=dtype)
-
-    i = 0
-    for s in range(len(seizure_begin) - num_test_sz - num_val_sz):
-        preictal_train[i:i + (pil // seq_duration)] = get_preictal(subject_path, seizure_begin[s], seq_len, fs, sph, pil, channels, dtype=dtype)
-        i += (pil // seq_duration)
-    if (verbose):
-        print(preictal_train.shape)
-
-    i = 0
-    for s in range(len(seizure_begin) - num_test_sz - num_val_sz, len(seizure_begin) - num_test_sz):
-        preictal_val[i:i + (pil // seq_duration)] = get_preictal(subject_path, seizure_begin[s], seq_len, fs, sph, pil, channels, dtype=dtype)
-        i += (pil // seq_duration)
-    if (verbose):
-        print(preictal_val.shape)
-
-    i = 0
-    for s in range(len(seizure_begin) - num_test_sz, len(seizure_begin)):
-        preictal_test[i:i + (pil // seq_duration)] = get_preictal(subject_path, seizure_begin[s], seq_len, fs, sph, pil, channels, dtype=dtype)
-        i += (pil // seq_duration)
-    if (verbose):
-        print(preictal_test.shape)
-    
-    interictal = get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, sph, pil, distance, channels, ds=ds, dtype=dtype)
-    if (verbose):
-        print(interictal.shape)
-
-    split_idx_1 = int(len(interictal) * (1 - ((num_val_sz + num_test_sz) / len(seizure_begin))))
-    split_idx_2 = int(len(interictal) * (1 - ((num_test_sz) / len(seizure_begin))))
-    
-    interictal_train = interictal[:split_idx_1]
-    interictal_val = interictal[split_idx_1:split_idx_2]
-    interictal_test = interictal[split_idx_2:]
-
-    tr_labels = np.concatenate((np.zeros(len(interictal_train)), np.ones(len(preictal_train))))
-    tr_segments = np.concatenate((interictal_train, preictal_train), axis=0)
-    
-    vl_labels = np.concatenate((np.zeros(len(interictal_val)), np.ones(len(preictal_val))))
-    vl_segments = np.concatenate((interictal_val, preictal_val), axis=0)
-
-    ts_labels = np.concatenate((np.zeros(len(interictal_test)), np.ones(len(preictal_test))))
-    ts_segments = np.concatenate((interictal_test, preictal_test), axis=0)
-
-    return tr_segments, vl_segments, ts_segments, tr_labels, vl_labels, ts_labels, fs
-
-def load_data_partitions(subject_path, seq_duration, pil, distance, channels=[], ds=1, dtype=np.float64, shuffle=False, verbose=False):
+def load_data_partitions(subject_path, seq_duration, pil, sph, distance, channels=[], ds=1, dtype=np.float64, shuffle=False, verbose=False):
     np.random.seed(SEED)
     # load info file
     data_info = loadmat(subject_path + '_info.mat')
@@ -285,37 +168,41 @@ def load_data_partitions(subject_path, seq_duration, pil, distance, channels=[],
         if (seizure_begin[i] < seizure_end[i-1] + LEAD_SEIZURE_DISTANCE):
             to_remove.append(i)
     for i in range(len(seizure_begin)):
-        if (seizure_begin[i] - SPH - pil < 0 and not i in to_remove):
+        if (seizure_begin[i] - sph - pil < 0 and not i in to_remove):
             to_remove.append(i)
 
     if (verbose):
         print(to_remove)
     if (len(to_remove) > 0):
-        seizure_begin = np.delete(seizure_begin, to_remove, axis=0)
-        seizure_end = np.delete(seizure_end, to_remove, axis=0)
+        valid_seizures = np.delete(seizure_begin, to_remove, axis=0)
 
     seq_len = seq_duration * fs
 
-    preictal = np.zeros((len(seizure_begin), pil // seq_duration, seq_len, len(channels)), dtype=dtype)
+    preictal = np.zeros((len(valid_seizures), pil // seq_duration, seq_len, len(channels)), dtype=dtype)
     i = 0
-    for s in seizure_begin:
-        preictal[i] = get_preictal(subject_path, s, seq_len, fs, SPH, pil, channels, dtype=dtype)
+    for s in valid_seizures:
+        preictal[i] = get_preictal(subject_path, s, seq_len, fs, sph, pil, channels, dtype=dtype)
         i += 1
     if(shuffle):
-        preictal = np.array_split(np.random.shuffle(np.concatenate(preictal[:])))
+        preictal = np.array_split(np.random.shuffle(np.concatenate((preictal[:]))), len(seizure_begin), axis=0)
     if (verbose):
         print(preictal.shape)
 
-    interictal = get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, SPH, pil, distance, channels, ds=ds, dtype=dtype)
+    interictal = get_interictal(subject_path, seizure_begin, seizure_end, seq_len, fs, sph, pil, distance, channels, ds=ds, dtype=dtype)
+    # interictal = np.zeros((len(seizure_begin), LEAD_SEIZURE_DISTANCE // seq_duration, seq_len, len(channels)), dtype=dtype)
+    # i = 0
+    # for s in seizure_begin:
+    #     interictal[i] = get_interictal_new(subject_path, s, seq_len, fs, sph, pil, distance, channels, ds, dtype)
+    #     i += 1
     if(shuffle):
         interictal = np.random.shuffle(interictal)
     if (verbose):
         print(interictal.shape)
-    interictal = np.array_split(interictal, len(seizure_begin), axis=0)
+    interictal = np.array_split(interictal, len(valid_seizures), axis=0)
     
 
     data = []
-    for n in range(len(seizure_begin)):
+    for n in range(len(valid_seizures)):
         labels = np.concatenate((np.zeros(len(interictal[n])), np.ones(len(preictal[n]))))
         segments = np.concatenate((interictal[n], preictal[n]), axis=0)
         data.append([segments, labels])
@@ -362,23 +249,21 @@ class Results:
 def evaluate_performance(y_pred, y_true):
     y_pred = y_pred.astype(np.float64)
     y_true = y_true.astype(np.float64)
-    if (np.any(np.isnan(y_pred))):
-        print('NaN found')
-    if (np.any(np.isinf(y_pred))):
-        print('INF found')
-    y_pred_pos_prob = F.softmax(torch.tensor(y_pred), dim=1)[:, 1]
-    # TODO: change pos label to 0 and neg prediction
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred_pos_prob, pos_label=1)
-    roc_auc = auc(fpr, tpr)
-    # roc_auc = roc_auc_score(y_true, y_pred_pos_prob)
-    f1 = f1_score(y_true, np.argmax(y_pred, axis=1))
-    precision, recall, _ = precision_recall_curve(y_true, y_pred_pos_prob)
-    pr_auc = auc(recall, precision)
-    tn, fp, fn, tp = confusion_matrix(y_true, np.argmax(y_pred, axis=1)).ravel()
-    sensitivity = tp / (tp + fn)
-    specificity = tn / (tn + fp)
+    try:
+        y_pred_pos_prob = F.softmax(torch.tensor(y_pred), dim=1)[:, 1]
+        fpr, tpr, thresholds = roc_curve(y_true, y_pred_pos_prob, pos_label=1)
+        roc_auc = auc(fpr, tpr)
+        f1 = f1_score(y_true, np.argmax(y_pred, axis=1))
+        precision, recall, _ = precision_recall_curve(y_true, y_pred_pos_prob)
+        pr_auc = auc(recall, precision)
+        tn, fp, fn, tp = confusion_matrix(y_true, np.argmax(y_pred, axis=1)).ravel()
+        sensitivity = tp / (tp + fn)
+        specificity = tn / (tn + fp)
+    except ValueError:
+        print("NAN or INF found.")
+    except:
+        print("Other error.")
 
-    # plt.plot(fpr, tpr)
 
     return sensitivity, specificity, roc_auc, f1, pr_auc
 
